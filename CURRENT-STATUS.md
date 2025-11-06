@@ -44,8 +44,8 @@
   - Complete feature set (6 phases)
   - 11 feature screenshots
   - Comprehensive validation testing
-- **Location**: `/mockup`
-- **Documentation**: `/mockup/.context.md`, `/docs/plan-mockup/FEATURE-SHOWCASE.md`
+- **Location**: `/encore_archive/mockup-backup` (archived after conversion to encore_frontend)
+- **Documentation**: `/encore_archive/mockup-backup/.context.md`, `/docs/plan-mockup/FEATURE-SHOWCASE.md`
 
 ### 2. Planning & Documentation (100% Complete)
 
