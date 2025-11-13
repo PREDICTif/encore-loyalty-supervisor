@@ -12,6 +12,81 @@
 
 Implement the **Feedback Management** system for the Encore Loyalty backend. This includes reading feedback from the legacy MySQL database, storing AI responses in DynamoDB, managing feedback status, and tracking feedback history.
 
+## ⚠️ CRITICAL: Legacy MySQL Schema
+
+**There is NO `feedback` table in MySQL!** The legacy system stores comments in these tables:
+
+### Primary Tables & Schema
+
+**`comment` table** (the actual feedback):
+- `iddatasession` (INT) - Primary key, links to datasession
+- `comment` (TEXT) - The actual feedback text
+- `overall_rating` (INT) - Rating 1-5 (NOTE: 99.59% are 0 in production)
+- `emailaddress` (VARCHAR) - Customer email
+- `dateentered` (DATETIME) - When feedback was created
+- `reply_details` (TEXT) - Legacy replies (if any)
+- `isdeleted` (TINYINT) - Soft delete flag
+
+**`datasession` table** (links comment to venue):
+- `iddatasession` (INT) - Primary key
+- `idclient` (INT) - Venue ID (FK to client table)
+- `isdeleted` (TINYINT) - Soft delete flag
+
+**`client` table** (venue information):
+- `idclient` (INT) - Primary key
+- `description` (VARCHAR) - Venue name
+
+**`eclub` table** (customer details - may be NULL):
+- `iddatasession` (INT) - Links to datasession
+- `firstname` (VARCHAR) - Customer first name
+- `lastname` (VARCHAR) - Customer last name
+- `phonenumber` (VARCHAR) - Customer phone
+
+### Required JOINs
+
+To get complete feedback data, you MUST use these JOINs:
+
+```sql
+FROM comment c
+INNER JOIN datasession ds ON c.iddatasession = ds.iddatasession
+LEFT JOIN eclub e ON c.iddatasession = e.iddatasession
+INNER JOIN client cl ON ds.idclient = cl.idclient
+WHERE 
+    c.isdeleted = 0
+    AND ds.isdeleted = 0
+    AND c.comment IS NOT NULL
+    AND c.comment != ''
+```
+
+### Field Mapping: MySQL → Our API Models
+
+| Our Model Field | MySQL Source | Notes |
+|----------------|--------------|-------|
+| `id` | `c.iddatasession` | Primary key |
+| `comment` | `c.comment` | Feedback text |
+| `rating` | `c.overall_rating` | 99.59% are 0! |
+| `created_at` | `c.dateentered` | Timestamp |
+| `venue_id` | `ds.idclient` | Via datasession |
+| `venue_name` | `cl.description` | Via client |
+| `customer_email` | `c.emailaddress` | Direct |
+| `customer_name` | `e.firstname + e.lastname` | Via eclub (may be NULL) |
+| `customer_phone` | `e.phonenumber` | Via eclub (may be NULL) |
+
+### What Goes Where
+
+**MySQL (READ-ONLY):**
+- Historical feedback/comments
+- Customer information
+- Venue links
+- Never write to MySQL!
+
+**DynamoDB (READ/WRITE):**
+- Feedback status (pending, reviewed, sent, etc.)
+- AI-generated responses
+- Sentiment analysis results
+- Action history
+- Email send tracking
+
 ## 🎯 Objectives
 
 1. Create feedback models (MySQL read + DynamoDB write)
@@ -352,31 +427,61 @@ class MySQLService:
 
     def get_feedback_by_id(self, feedback_id: int) -> Optional[Dict[str, Any]]:
         """
-        Get single feedback by ID from MySQL
-
-        Returns raw dict from database
+        Get single feedback by ID from MySQL legacy comment table
+        
+        CRITICAL: This queries the legacy MySQL database (READ-ONLY)
+        We join comment, datasession, eclub, and client tables
+        
+        Returns raw dict from database with combined data
         """
         with get_mysql_connection() as conn:
             cursor = conn.cursor(dictionary=True)
 
-            # Adjust query based on actual table schema
-            # This is a template - update field names as needed
+            # Query legacy comment table with proper JOINs
+            # iddatasession is the primary key linking all tables
             query = """
                 SELECT
-                    id,
-                    venue_id,
-                    customer_email,
-                    customer_name,
-                    rating,
-                    comment,
-                    created_at
-                FROM feedback
-                WHERE id = %s
+                    c.iddatasession AS id,
+                    c.comment AS comment,
+                    c.overall_rating AS rating,
+                    c.dateentered AS created_at,
+                    c.reply_details AS legacy_replies,
+                    
+                    -- Venue information
+                    ds.idclient AS venue_id,
+                    cl.description AS venue_name,
+                    
+                    -- Customer information from comment table
+                    c.emailaddress AS customer_email,
+                    
+                    -- Customer information from eclub table (may be NULL)
+                    e.firstname AS customer_first_name,
+                    e.lastname AS customer_last_name,
+                    e.phonenumber AS customer_phone
+                    
+                FROM comment c
+                INNER JOIN datasession ds ON c.iddatasession = ds.iddatasession
+                LEFT JOIN eclub e ON c.iddatasession = e.iddatasession
+                INNER JOIN client cl ON ds.idclient = cl.idclient
+                
+                WHERE 
+                    c.iddatasession = %s
+                    AND c.isdeleted = 0
+                    AND ds.isdeleted = 0
             """
 
             cursor.execute(query, (feedback_id,))
             result = cursor.fetchone()
             cursor.close()
+            
+            # Combine customer name from eclub data if available
+            if result:
+                first_name = result.get('customer_first_name', '')
+                last_name = result.get('customer_last_name', '')
+                if first_name or last_name:
+                    result['customer_name'] = f"{first_name} {last_name}".strip()
+                else:
+                    result['customer_name'] = None
 
             return result
 
@@ -385,80 +490,129 @@ class MySQLService:
         filters: FeedbackFilter
     ) -> Tuple[List[Dict[str, Any]], int]:
         """
-        List feedback with filters and pagination
-
-        Returns (items, total_count)
+        List feedback with filters and pagination from MySQL legacy tables
+        
+        CRITICAL: Queries legacy comment table with JOINs (READ-ONLY)
+        Returns (items list, total_count)
         """
         with get_mysql_connection() as conn:
             cursor = conn.cursor(dictionary=True)
 
             # Build WHERE clause based on filters
-            where_clauses = []
+            # Start with base conditions (not deleted, has comment text)
+            where_clauses = [
+                "c.isdeleted = 0",
+                "ds.isdeleted = 0",
+                "c.comment IS NOT NULL",
+                "c.comment != ''"
+            ]
             params = []
 
+            # Venue filter
             if filters.venue_id:
-                where_clauses.append("venue_id = %s")
+                where_clauses.append("ds.idclient = %s")
                 params.append(filters.venue_id)
 
+            # Rating filter (note: 99.59% are 0 in legacy data)
             if filters.rating:
-                where_clauses.append("rating = %s")
+                where_clauses.append("c.overall_rating = %s")
                 params.append(filters.rating)
 
+            # Date range filters
             if filters.date_from:
-                where_clauses.append("created_at >= %s")
+                where_clauses.append("c.dateentered >= %s")
                 params.append(filters.date_from)
 
             if filters.date_to:
-                where_clauses.append("created_at <= %s")
+                where_clauses.append("c.dateentered <= %s")
                 params.append(filters.date_to)
 
+            # Search filter (in comment text or customer names)
             if filters.search_text:
                 where_clauses.append(
-                    "(comment LIKE %s OR customer_name LIKE %s)"
+                    "(c.comment LIKE %s OR e.firstname LIKE %s OR e.lastname LIKE %s)"
                 )
                 search_pattern = f"%{filters.search_text}%"
-                params.extend([search_pattern, search_pattern])
+                params.extend([search_pattern, search_pattern, search_pattern])
 
-            # Build WHERE clause
-            where_sql = ""
-            if where_clauses:
-                where_sql = "WHERE " + " AND ".join(where_clauses)
+            # Build WHERE clause SQL
+            where_sql = "WHERE " + " AND ".join(where_clauses)
 
-            # Get total count
-            count_query = f"SELECT COUNT(*) as total FROM feedback {where_sql}"
+            # Get total count with same filters
+            count_query = f"""
+                SELECT COUNT(*) as total 
+                FROM comment c
+                INNER JOIN datasession ds ON c.iddatasession = ds.iddatasession
+                LEFT JOIN eclub e ON c.iddatasession = e.iddatasession
+                INNER JOIN client cl ON ds.idclient = cl.idclient
+                {where_sql}
+            """
             cursor.execute(count_query, params)
             total = cursor.fetchone()['total']
 
-            # Get paginated results
+            # Get paginated results with same filters
             offset = (filters.page - 1) * filters.page_size
 
             query = f"""
                 SELECT
-                    id,
-                    venue_id,
-                    customer_email,
-                    customer_name,
-                    rating,
-                    comment,
-                    created_at
-                FROM feedback
+                    c.iddatasession AS id,
+                    c.comment AS comment,
+                    c.overall_rating AS rating,
+                    c.dateentered AS created_at,
+                    
+                    -- Venue info
+                    ds.idclient AS venue_id,
+                    cl.description AS venue_name,
+                    
+                    -- Customer info
+                    c.emailaddress AS customer_email,
+                    e.firstname AS customer_first_name,
+                    e.lastname AS customer_last_name,
+                    e.phonenumber AS customer_phone
+                    
+                FROM comment c
+                INNER JOIN datasession ds ON c.iddatasession = ds.iddatasession
+                LEFT JOIN eclub e ON c.iddatasession = e.iddatasession
+                INNER JOIN client cl ON ds.idclient = cl.idclient
                 {where_sql}
-                ORDER BY created_at DESC
+                ORDER BY c.dateentered DESC
                 LIMIT %s OFFSET %s
             """
 
             cursor.execute(query, params + [filters.page_size, offset])
             items = cursor.fetchall()
             cursor.close()
+            
+            # Post-process results to combine customer name
+            for item in items:
+                first_name = item.get('customer_first_name', '')
+                last_name = item.get('customer_last_name', '')
+                if first_name or last_name:
+                    item['customer_name'] = f"{first_name} {last_name}".strip()
+                else:
+                    item['customer_name'] = None
 
             return items, total
 
     def get_feedback_count_by_venue(self, venue_id: str) -> int:
-        """Get total feedback count for a venue"""
+        """
+        Get total feedback count for a venue from legacy MySQL
+        
+        Uses comment table with JOINs
+        """
         with get_mysql_connection() as conn:
             cursor = conn.cursor()
 
-            query = "SELECT COUNT(*) FROM feedback WHERE venue_id = %s"
+            query = """
+                SELECT COUNT(*) 
+                FROM comment c
+                INNER JOIN datasession ds ON c.iddatasession = ds.iddatasession
+                WHERE ds.idclient = %s
+                    AND c.isdeleted = 0
+                    AND ds.isdeleted = 0
+                    AND c.comment IS NOT NULL
+                    AND c.comment != ''
+            """
             cursor.execute(query, (venue_id,))
             count = cursor.fetchone()[0]
             cursor.close()

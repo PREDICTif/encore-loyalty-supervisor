@@ -13,6 +13,62 @@
 
 Integrate the **Feedback Management** system into the React frontend. This includes creating feedback list and detail pages, connecting to real backend API, implementing filtering and search, and maintaining the mock API toggle for development.
 
+## ⚠️ CRITICAL: Understanding the Data Architecture
+
+The backend serves feedback data from **two sources**:
+
+### Data Sources
+
+**1. MySQL Legacy Database (Read-Only via Backend):**
+- Historical customer feedback/comments
+- Customer names, emails, phone numbers
+- Venue information
+- Ratings (note: 99.59% are 0 in production data)
+- Created dates
+
+**2. DynamoDB (Read/Write via Backend):**
+- Feedback processing status (pending, reviewed, sent, etc.)
+- AI-generated responses
+- Sentiment analysis results
+- Action history and timestamps
+- Email send tracking
+
+### What the Frontend Receives
+
+The backend **combines** both sources into a single unified `Feedback` object:
+
+```typescript
+interface Feedback {
+  // From MySQL (via backend):
+  id: number;                    // iddatasession from comment table
+  venue_id: string;              // idclient from datasession
+  venue_name?: string;           // description from client table
+  customer_email: string;        // emailaddress from comment table
+  customer_name?: string;        // Combined from eclub.firstname + lastname
+  rating?: number;               // overall_rating from comment table (99.59% are 0!)
+  comment: string;               // comment from comment table
+  created_at: string;            // dateentered from comment table
+  
+  // From DynamoDB (via backend):
+  status: FeedbackStatus;        // Current processing status
+  sentiment?: Sentiment;         // AI sentiment analysis
+  ai_response_id?: string;       // ID of AI response (if generated)
+  last_updated?: string;         // Last status update time
+  last_action_by?: string;       // User who last acted
+  response_count: number;        // Times response regenerated
+  email_sent_count: number;      // Times email sent
+}
+```
+
+### Frontend Developer Notes
+
+1. **You never directly query MySQL** - the backend handles this
+2. **All API calls go through `/api/feedback` endpoints**
+3. **The backend joins 4 MySQL tables** (comment, datasession, client, eclub) and enriches with DynamoDB status
+4. **Customer names may be NULL** - handle gracefully in UI
+5. **Ratings are mostly 0** - consider hiding if 0
+6. **Legacy replies** exist in MySQL `reply_details` field but aren't used in new system
+
 ## 🎯 Objectives
 
 1. Create feedback types (matching backend models)
